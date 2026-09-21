@@ -34,10 +34,12 @@ array.
 """
 
 import ast
+import hashlib
 import json
 import math
 import pprint
 import re
+import time
 import uuid
 
 from oslo_config import cfg
@@ -51,6 +53,7 @@ import taskflow.engines
 from taskflow.patterns import linear_flow
 
 from cinder import context
+from cinder import coordination
 from cinder import exception
 from cinder import flow_utils
 from cinder.i18n import _
@@ -137,6 +140,21 @@ hpe3par_opts = [
                     "(3) the backend is prezoned with this "
                     "specific nsp only. For example if nsp is 2 1 2, the "
                     "format of the option's value is 2:1:2"),
+    cfg.BoolOpt('hpe3par_image_seed_cache_enabled',
+                default=True,
+                help="Enable the per-size image seed clone cache. When a "
+                     "bootable volume larger than its source image is "
+                     "created from a Glance image stored on this array, the "
+                     "first such request builds a reusable read-only 'seed' "
+                     "volume at the requested size so that subsequent "
+                     "same-size requests are served as fast online clones. "
+                     "Disabled automatically for replicated volume types and "
+                     "CHAP-enabled backends."),
+    cfg.IntOpt('hpe3par_image_seed_max_age_days',
+               default=7,
+               min=1,
+               help="Number of days an unused image seed volume is retained "
+                    "before it is automatically deleted."),
 ]
 
 
@@ -349,6 +367,10 @@ class HPE3PARCommon(object):
     RC_GROUP_STARTED = 3
     SYNC_STATUS_COMPLETED = 3
     FAILBACK_VALUE = 'default'
+
+    # Image seed (per-size clone cache) markers
+    IMAGE_SEED_PREFIX = "ims-"
+    IMAGE_SEED_COMMENT_TYPE = "hpe_image_seed"
 
     # License values for reported capabilities
     PRIORITY_OPT_LIC = "Priority Optimization"
@@ -978,42 +1000,26 @@ class HPE3PARCommon(object):
         target_vol_name = self._get_existing_volume_ref_name(existing_ref)
 
         # Check for the existence of the virtual volume.
-        old_comment_str = ""
         try:
             vol = self.client.getVolume(target_vol_name)
-            if 'comment' in vol:
-                old_comment_str = vol['comment']
         except hpeexceptions.HTTPNotFound:
             err = (_("Virtual volume '%s' doesn't exist on array.") %
                    target_vol_name)
             LOG.error(err)
             raise exception.InvalidInput(reason=err)
 
-        new_comment = {}
-
         # Use the display name from the existing volume if no new name
         # was chosen by the user.
         if volume['display_name']:
             display_name = volume['display_name']
-            new_comment['display_name'] = volume['display_name']
         elif 'comment' in vol:
             display_name = self._get_3par_vol_comment_value(vol['comment'],
                                                             'display_name')
-            if display_name:
-                new_comment['display_name'] = display_name
         else:
             display_name = None
 
         # Generate the new volume information based on the new ID.
         new_vol_name = self._get_3par_vol_name(volume)
-        # No need to worry about "_name_id" because this is a newly created
-        # volume that cannot have been migrated.
-        name = 'volume-' + volume['id']
-
-        new_comment['volume_id'] = volume['id']
-        new_comment['name'] = name
-        new_comment['type'] = 'OpenStack'
-        self._add_name_id_to_comment(new_comment, volume)
 
         volume_type = None
         if volume['volume_type_id']:
@@ -1024,8 +1030,7 @@ class HPE3PARCommon(object):
                           volume['volume_type_id'])
                 raise exception.ManageExistingVolumeTypeMismatch(reason=reason)
 
-        new_vals = {'newName': new_vol_name,
-                    'comment': json.dumps(new_comment)}
+        new_vals = {'newName': new_vol_name}
 
         # Ensure that snapCPG is set
         if 'snapCPG' not in vol and self.API_VERSION < API_VERSION_2023:
@@ -1035,8 +1040,15 @@ class HPE3PARCommon(object):
                      {'disp': display_name, 'new': new_vol_name,
                       'cpg': new_vals['snapCPG']})
 
-        # Update the existing volume with the new name and comments.
+        # Update the existing volume with the new name.
         self.client.modifyVolume(target_vol_name, new_vals)
+
+        # The values that are needed by the driver later on are kept in the
+        # backend's key/value store instead of the volume comment, since
+        # modifying a comment requires a PUT on the volume.
+        self._set_volume_metadata(new_vol_name,
+                                  volume_id=volume['id'],
+                                  _name_id=volume.get('_name_id'))
 
         LOG.info("Virtual volume '%(ref)s' renamed to '%(new)s'.",
                  {'ref': existing_ref['source-name'], 'new': new_vol_name})
@@ -1059,11 +1071,11 @@ class HPE3PARCommon(object):
                     LOG.warning("Failed to manage virtual volume %(disp)s "
                                 "due to error during retype.",
                                 {'disp': display_name})
-                    # Try to undo the rename and clear the new comment.
+                    # Try to undo the rename. The original comment was never
+                    # modified, so there is nothing to restore there.
                     self.client.modifyVolume(
                         new_vol_name,
-                        {'newName': target_vol_name,
-                         'comment': old_comment_str})
+                        {'newName': target_vol_name})
 
         updates = {'display_name': display_name}
         if retyped and model_update:
@@ -1111,36 +1123,30 @@ class HPE3PARCommon(object):
             LOG.error(err)
             raise exception.InvalidInput(reason=err)
 
-        new_comment = {}
-
         # Use the display name from the existing snapshot if no new name
         # was chosen by the user.
         if snapshot['display_name']:
             display_name = snapshot['display_name']
-            new_comment['display_name'] = snapshot['display_name']
         elif 'comment' in snap:
             display_name = self._get_3par_vol_comment_value(snap['comment'],
                                                             'display_name')
-            if display_name:
-                new_comment['display_name'] = display_name
         else:
             display_name = None
 
         # Generate the new snapshot information based on the new ID.
         new_snap_name = self._get_3par_snap_name(snapshot['id'])
-        new_comment['volume_id'] = volume['id']
-        new_comment['volume_name'] = 'volume-' + volume['id']
-        self._add_name_id_to_comment(new_comment, volume)
-        if snapshot.get('display_description', None):
-            new_comment['description'] = snapshot['display_description']
-        else:
-            new_comment['description'] = ""
 
-        new_vals = {'newName': new_snap_name,
-                    'comment': json.dumps(new_comment)}
+        new_vals = {'newName': new_snap_name}
 
-        # Update the existing snapshot with the new name and comments.
+        # Update the existing snapshot with the new name.
         self.client.modifyVolume(target_snap_name, new_vals)
+
+        # The values that are needed by the driver later on are kept in the
+        # backend's key/value store instead of the snapshot comment, since
+        # modifying a comment requires a PUT on the volume.
+        self._set_volume_metadata(new_snap_name,
+                                  volume_id=volume['id'],
+                                  _name_id=volume.get('_name_id'))
 
         LOG.info("Snapshot '%(ref)s' renamed to '%(new)s'.",
                  {'ref': existing_ref['source-name'], 'new': new_snap_name})
@@ -1268,6 +1274,9 @@ class HPE3PARCommon(object):
             if cpg == cinder_cpg:
                 size_gb = int(vol['sizeMiB'] / 1024)
                 vol_name = vol['name']
+                if vol_name.startswith(self.IMAGE_SEED_PREFIX):
+                    # Internal image seed cache volumes are not manageable.
+                    continue
                 if vol_name in already_managed:
                     is_safe = False
                     reason_not_safe = _('Volume already managed')
@@ -1824,6 +1833,9 @@ class HPE3PARCommon(object):
                       'replication_enabled': self._replication_enabled,
                       'replication_targets': self._get_replication_targets(),
                       'pools': pools}
+
+        # Opportunistically prune expired image seed cache volumes.
+        self._maybe_cleanup_image_seeds()
 
     def _check_license_enabled(self, valid_licenses,
                                license_to_check, capability):
@@ -2769,6 +2781,18 @@ class HPE3PARCommon(object):
                 # The size of the new volume is different, so we have to
                 # copy the volume and wait.  Do the resize after the copy
                 # is complete.
+                #
+                # When the source is a Cinder image-volume-cache entry (a
+                # raw, already-converted image) and the target is larger,
+                # serve the clone from a per-size image seed so only the
+                # first larger-than-image request pays the full offline
+                # copy and the rest are fast online clones.
+                handled, seed_model_update = (
+                    self._maybe_clone_via_image_seed(
+                        volume, src_vref, vol_name))
+                if handled:
+                    return seed_model_update
+
                 LOG.debug("Creating a clone of volume, using non-online copy.")
 
                 # we first have to create the destination volume
@@ -2817,6 +2841,304 @@ class HPE3PARCommon(object):
         except Exception as ex:
             LOG.error("Exception: %s", ex)
             raise exception.CinderException(ex)
+
+    # ---- Image seed (per-size clone cache) ------------------------------
+    #
+    # When a bootable volume is created from a Glance image, Cinder clones it
+    # from the raw image-volume-cache entry.  When the requested root disk is
+    # larger than that cache volume, the normal path performs a full offline
+    # base copy for every volume.  To avoid paying that cost repeatedly, the
+    # first larger-than-image request for a given (cache image, size) builds
+    # a read-only "image seed": a base volume, at the requested size, holding
+    # the image contents.  Every subsequent request for the same (image,
+    # size) is then an equal-size online clone from the seed, which is fast.
+    #
+    # The seed is always built from the raw cache volume, so it is correct
+    # for both raw and qcow2 images.  Seeds are not tracked by Cinder, so
+    # they are pruned automatically once unused for
+    # hpe3par_image_seed_max_age_days.
+
+    def _image_seed_cache_enabled(self):
+        return bool(self.config.safe_get('hpe3par_image_seed_cache_enabled'))
+
+    def _image_seed_max_age_seconds(self):
+        days = self.config.safe_get('hpe3par_image_seed_max_age_days')
+        try:
+            days = int(days)
+        except (TypeError, ValueError):
+            days = 7
+        if days <= 0:
+            days = 7
+        return days * 24 * 60 * 60
+
+    def _image_seed_name(self, image_id, size):
+        digest = hashlib.sha1(
+            ("%s:%s" % (image_id, size)).encode("utf-8")).hexdigest()
+        return "%s%s" % (self.IMAGE_SEED_PREFIX, digest[:24])
+
+    def _maybe_clone_via_image_seed(self, volume, src_vref, vol_name):
+        """Serve a larger-than-image clone from a per-size image seed.
+
+        Cinder clones a bootable volume from the raw image-volume-cache
+        entry.  When the requested root disk is larger than that cache
+        volume, the normal path performs a full offline base copy for every
+        volume.  Instead, build a per-(cache image, size) seed once and serve
+        subsequent requests as fast online clones.  Working from the raw
+        cache volume makes this correct for both raw and qcow2 images.
+
+        Returns (handled, model_update).  handled is False when the seed
+        path does not apply, so the caller falls back to the normal copy.
+        """
+        if not self._image_seed_cache_enabled():
+            return False, None
+        # Disabled for replicated and CHAP setups.
+        if self._volume_of_replicated_type(volume, hpe_tiramisu_check=True):
+            return False, None
+        if self._client_conf.get('hpe3par_iscsi_chap_enabled'):
+            return False, None
+        # Only meaningful when the source is a Cinder image-volume-cache
+        # entry (a raw, already-converted image) and the target is larger.
+        try:
+            if not volume_utils.is_image_cache_entry(src_vref):
+                return False, None
+        except Exception:
+            return False, None
+        if volume['size'] <= src_vref['size']:
+            return False, None
+
+        try:
+            type_info = self.get_volume_settings_from_type(volume)
+            cpg = type_info['cpg']
+            snap_cpg = type_info['snap_cpg']
+            src_vol_name = self._get_3par_vol_name(src_vref)
+            seed_key = src_vref['id']
+            seed_name = self._image_seed_name(seed_key, volume['size'])
+
+            seed = self._get_image_seed_details(seed_name)
+            if seed is None:
+                # Build the seed under a lock so only one request builds it
+                # for a given (image, size); concurrent requests wait, then
+                # find the seed and clone from it.
+                lock_name = 'hpe3par-image-seed-%s' % seed_name
+                with coordination.COORDINATOR.get_lock(lock_name):
+                    seed = self._get_image_seed_details(seed_name)
+                    if seed is None:
+                        self._create_image_seed(
+                            seed_name, src_vol_name, seed_key,
+                            volume['size'], cpg, snap_cpg,
+                            type_info['tpvv'], type_info['tdvv'],
+                            self.get_compression_policy(
+                                type_info['hpe3par_keys']))
+                        seed = self._get_image_seed_details(seed_name)
+
+            model_update = self._clone_boot_volume_from_seed(
+                volume, vol_name, seed_name, type_info)
+            if seed is not None:
+                self._touch_image_seed(seed_name, seed['_seed_meta'])
+            LOG.debug("Cloned volume %(vol)s from image seed %(seed)s.",
+                      {'vol': vol_name, 'seed': seed_name})
+            return True, model_update
+        except Exception as ex:
+            # Never fail volume creation because of the optimization; fall
+            # back to the standard clone-and-wait path.
+            LOG.warning("Image seed clone failed for volume %(vol)s; falling "
+                        "back to standard clone. Reason: %(err)s",
+                        {'vol': volume.get('id'), 'err': ex})
+            return False, None
+
+    def _build_image_seed_comment(self, image_id, size, created_at,
+                                  last_used_at):
+        return json.dumps({
+            'type': self.IMAGE_SEED_COMMENT_TYPE,
+            'image_id': image_id,
+            'size': size,
+            'created_at': created_at,
+            'last_used_at': last_used_at,
+        })
+
+    def _get_image_seed_details(self, seed_name):
+        """Return the seed volume dict (with '_seed_meta') if it is a seed."""
+        try:
+            seed = self.client.getVolume(seed_name)
+        except hpeexceptions.HTTPNotFound:
+            return None
+        comment = seed.get('comment')
+        if not comment:
+            return None
+        try:
+            meta = json.loads(comment)
+        except (ValueError, TypeError):
+            return None
+        if meta.get('type') != self.IMAGE_SEED_COMMENT_TYPE:
+            return None
+        seed['_seed_meta'] = meta
+        return seed
+
+    def _touch_image_seed(self, seed_name, meta):
+        """Best-effort refresh of a seed's last-used timestamp."""
+        try:
+            meta = dict(meta)
+            meta['last_used_at'] = time.time()
+            self.client.modifyVolume(seed_name, {'comment': json.dumps(meta)})
+        except Exception as ex:
+            LOG.debug("Could not update image seed %(seed)s usage time: "
+                      "%(err)s", {'seed': seed_name, 'err': ex})
+
+    def _create_image_seed(self, seed_name, image_vol_name, image_id,
+                           size, cpg, snap_cpg, tpvv, tdvv, compression):
+        """Build a read-only base seed from image_vol grown to size (GiB)."""
+        LOG.info("Building image seed %(seed)s from %(img)s at %(size)s GiB.",
+                 {'seed': seed_name, 'img': image_vol_name, 'size': size})
+        task_id = self._copy_volume(
+            image_vol_name, seed_name, cpg=cpg, snap_cpg=snap_cpg,
+            tpvv=tpvv, tdvv=tdvv, compression=compression)
+        task_status = self._wait_for_task_completion(task_id)
+        if task_status['status'] is not self.client.TASK_DONE:
+            try:
+                self.client.deleteVolume(seed_name)
+            except Exception:
+                LOG.warning("Could not clean up failed image seed %(seed)s.",
+                            {'seed': seed_name})
+            msg = _("Image seed copy task failed: seed=%(seed)s, "
+                    "status=%(status)s.") % {'seed': seed_name,
+                                             'status': task_status}
+            raise exception.VolumeBackendAPIException(data=msg)
+
+        image_vol = self.client.getVolume(image_vol_name)
+        image_size_mib = int(image_vol['sizeMiB'])
+        target_mib = self._capacity_from_size(size)
+        growth_mib = target_mib - image_size_mib
+        if growth_mib > 0:
+            self.client.growVolume(seed_name, growth_mib)
+
+        now = time.time()
+        comment = self._build_image_seed_comment(image_id, size, now, now)
+        self.client.modifyVolume(seed_name, {'comment': comment})
+        LOG.info("Image seed %(seed)s ready.", {'seed': seed_name})
+
+    def _clone_boot_volume_from_seed(self, volume, vol_name, seed_name,
+                                     type_info):
+        """Create the boot volume as a fast online clone of a seed."""
+        cpg = type_info['cpg']
+        qos = type_info['qos']
+        vvs_name = type_info['vvs_name']
+        flash_cache = self.get_flash_cache_policy(type_info['hpe3par_keys'])
+        compression = self.get_compression_policy(type_info['hpe3par_keys'])
+
+        # Build the standard clone comment and pass it to the copy so it is
+        # stamped as part of the online copy (via copyVolume's optional body)
+        # instead of a separate comment-only PUT afterwards, which some WSAPI
+        # v1 arrays time out on. This mirrors the equal-size online clone.
+        comments = {'volume_id': volume['id'],
+                    'name': volume['name'],
+                    'type': 'OpenStack'}
+        volume_type = type_info['volume_type']
+        type_id = volume.get('volume_type_id', None)
+        if type_id:
+            comments['volume_type_name'] = (
+                volume_type.get('name') if volume_type else None)
+            comments['volume_type_id'] = type_id
+            if vvs_name:
+                comments['vvs'] = vvs_name
+            else:
+                comments['qos'] = qos
+        display_name = volume.get('display_name', None)
+        if display_name:
+            comments['display_name'] = display_name
+
+        self._copy_volume(
+            seed_name, vol_name, cpg=cpg, snap_cpg=type_info['snap_cpg'],
+            tpvv=type_info['tpvv'], tdvv=type_info['tdvv'],
+            compression=compression, comment=json.dumps(comments))
+
+        LOG.debug(
+            'Online copy volume scheduled: clone_boot_volume_from_seed: '
+            'seed=%(seed)s, vol=%(vol)s.',
+            {'seed': seed_name, 'vol': vol_name})
+
+        # NOTE: We intentionally do NOT wait for the online copy task to
+        # complete here (same as the equal-size online clone path). On the
+        # array an online copy makes the volume immediately available while
+        # the physical copy proceeds in the background, so blocking on task
+        # completion only serialises bulk clone requests and slows down VM
+        # creation. The task is left to finish asynchronously on the array.
+
+        if qos or vvs_name or flash_cache is not None:
+            try:
+                self._add_volume_to_volume_set(
+                    volume, vol_name, cpg, vvs_name, qos, flash_cache)
+            except exception.InvalidInput as ex:
+                # Delete volume if unable to add it to the volume set
+                self.client.deleteVolume(vol_name)
+                dbg = {'volume': vol_name,
+                       'vvs_name': vvs_name,
+                       'err': str(ex)}
+                msg = _("Failed to add volume '%(volume)s' to vvset "
+                        "'%(vvs_name)s' because '%(err)s'") % dbg
+                LOG.error(msg)
+                raise exception.CinderException(msg)
+
+        hpe_tiramisu = self._volume_of_hpe_tiramisu_type(volume)
+        return self._get_model_update(volume['host'], cpg,
+                                      replication=False,
+                                      provider_location=self.client.id,
+                                      hpe_tiramisu=hpe_tiramisu)
+
+    def _maybe_cleanup_image_seeds(self):
+        """Throttled, best-effort pruning of expired image seeds."""
+        if not self._image_seed_cache_enabled():
+            return
+        now = time.time()
+        last = getattr(self, '_last_image_seed_cleanup', 0)
+        # Sweep at most once per hour.
+        if now - last < 3600:
+            return
+        self._last_image_seed_cleanup = now
+        try:
+            self._cleanup_expired_image_seeds()
+        except Exception as ex:
+            LOG.debug("Image seed cleanup skipped: %(err)s", {'err': ex})
+
+    def _cleanup_expired_image_seeds(self):
+        max_age = self._image_seed_max_age_seconds()
+        now = time.time()
+        try:
+            all_volumes = self.client.getVolumes()['members']
+        except Exception as ex:
+            LOG.debug("Could not list volumes for image seed cleanup: "
+                      "%(err)s", {'err': ex})
+            return
+
+        for vol in all_volumes:
+            name = vol.get('name') or ''
+            if not name.startswith(self.IMAGE_SEED_PREFIX):
+                continue
+            comment = vol.get('comment')
+            if comment is None:
+                try:
+                    comment = self.client.getVolume(name).get('comment')
+                except Exception:
+                    continue
+            if not comment:
+                continue
+            try:
+                meta = json.loads(comment)
+            except (ValueError, TypeError):
+                continue
+            if meta.get('type') != self.IMAGE_SEED_COMMENT_TYPE:
+                continue
+            last_used = meta.get('last_used_at') or meta.get('created_at') or 0
+            if now - last_used < max_age:
+                continue
+            lock_name = 'hpe3par-image-seed-%s' % name
+            try:
+                with coordination.COORDINATOR.get_lock(lock_name):
+                    self.client.deleteVolume(name)
+                LOG.info("Deleted expired image seed %(seed)s.",
+                         {'seed': name})
+            except Exception as ex:
+                LOG.debug("Could not delete expired image seed %(seed)s: "
+                          "%(err)s", {'seed': name, 'err': ex})
 
     def delete_volume(self, volume):
         vol_id = volume.id
@@ -3183,13 +3505,9 @@ class HPE3PARCommon(object):
         volume_id_name = self._get_3par_vol_name(volume['id'])
         try:
             # After this call the volume manager will call
-            # finish_volume_migration and swap the fields, so we want to
-            # have the right info on the comments if we succeed in renaming
-            # the volumes in the backend.
-            new_comment = self._get_updated_comment(current_name,
-                                                    volume_id=volume['id'],
-                                                    _name_id=None)
-            volumeMods = {'newName': volume_id_name, 'comment': new_comment}
+            # finish_volume_migration and swap the fields, so the rename is
+            # all that is needed here. The ids are tracked by cinder itself.
+            volumeMods = {'newName': volume_id_name}
             self.client.modifyVolume(current_name, volumeMods)
             LOG.info("Current volume changed from %(cur)s to %(orig)s",
                      {'cur': current_name, 'orig': volume_id_name})
@@ -3209,12 +3527,7 @@ class HPE3PARCommon(object):
         # cleaned up on the backend.
         if original_volume_renamed:
             try:
-                old_comment = self._get_updated_comment(
-                    original_name,
-                    volume_id=dest_volume['id'],
-                    _name_id=volume.get('_name_id'))
-                volumeCurrentMods = {'newName': current_name,
-                                     'comment': old_comment}
+                volumeCurrentMods = {'newName': current_name}
                 self.client.modifyVolume(temp_name, volumeCurrentMods)
             except Exception as e:
                 log_error('original', e, temp_name, current_name, temp_name)
@@ -3280,10 +3593,10 @@ class HPE3PARCommon(object):
             # the backend can't change the name.
             name_id = new_volume['_name_id'] or new_volume['id']
             provider_location = new_volume['provider_location']
-            # Update the comment in the backend to reflect the _name_id
+            # Update the metadata in the backend to reflect the _name_id
             current_name = self._get_3par_vol_name(new_volume)
-            self._update_comment(current_name, volume_id=volume['id'],
-                                 _name_id=name_id)
+            self._set_volume_metadata(current_name, volume_id=volume['id'],
+                                      _name_id=name_id)
 
         if new_volume_renamed:
             type_info = self.get_volume_settings_from_type(volume)
@@ -3300,17 +3613,64 @@ class HPE3PARCommon(object):
         if name_id:
             comment['_name_id'] = name_id
 
-    def _get_updated_comment(self, vol_name, **values):
-        vol = self.client.getVolume(vol_name)
-        comment = json.loads(vol['comment']) if vol.get('comment') else {}
-        comment.update(values)
+    @staticmethod
+    def _encode_metadata_value(value):
+        if isinstance(value, str):
+            return value
+        return json.dumps(value)
 
-    def _update_comment(self, vol_name, **values):
-        """Update key-value pairs on the comment of a volume in the backend."""
-        if not values:
-            return
-        comment = self._get_updated_comment(vol_name, **values)
-        self.client.modifyVolume(vol_name, {'comment': json.dumps(comment)})
+    @staticmethod
+    def _decode_metadata_value(value):
+        # Only dicts/lists are stored json encoded, everything else is
+        # stored as-is so that plain strings are returned unchanged.
+        if isinstance(value, str) and value[:1] in ('{', '['):
+            try:
+                return json.loads(value)
+            except ValueError:
+                return value
+        return value
+
+    def _set_volume_metadata(self, vol_name, **values):
+        """Store key/value pairs in the backend's metadata (KV) store.
+
+        The comment of a volume can only be modified with a PUT on the
+        volume, which can hang on the array. The KV store is used instead
+        for everything that has to be updated after creation time. A value
+        of None removes the key.
+        """
+        for key, value in values.items():
+            if value is None:
+                try:
+                    self.client.removeVolumeMetaData(vol_name, key)
+                except hpeexceptions.HTTPNotFound:
+                    pass
+            else:
+                self.client.setVolumeMetaData(
+                    vol_name, key, self._encode_metadata_value(value))
+
+    def _get_volume_key_value(self, vol_name, key, vol_comment=None):
+        """Read a value from the KV store, falling back to the comment.
+
+        Volumes created/managed before the move to the KV store still carry
+        these values in their comment, so the comment is used as a fallback.
+        """
+        try:
+            value = self.client.getVolumeMetaData(vol_name, key).get('value')
+            if value is not None:
+                return self._decode_metadata_value(value)
+        except hpeexceptions.HTTPNotFound:
+            pass
+
+        if vol_comment:
+            return self._get_3par_vol_comment_value(vol_comment, key)
+        return None
+
+    def _copy_volume_metadata(self, src_name, dest_name):
+        """Copy the KV store entries of a volume onto another volume."""
+        entries = self.client.getAllVolumeMetaData(src_name)
+        for member in entries.get('members', []):
+            self.client.setVolumeMetaData(dest_name, member['key'],
+                                          member['value'])
 
     def _wait_for_task_completion(self, task_id):
         """This waits for a 3PAR background task complete or fail.
@@ -3364,11 +3724,14 @@ class HPE3PARCommon(object):
                                         'snap': snap_str}))
                 raise exception.VolumeIsBusy(message=msg)
 
-            # Create a physical copy of the volume
+            # Create a physical copy of the volume. The comment is set at
+            # creation time so that no PUT (modifyVolume) with a comment is
+            # needed afterwards.
+            comment = self._get_3par_vol_comment(volume_name)
             task_id = self._copy_volume(volume_name, temp_vol_name,
                                         cpg, cpg, type_info['tpvv'],
                                         type_info['tdvv'],
-                                        compression)
+                                        compression, comment)
 
             LOG.debug('Copy volume scheduled: convert_to_base_volume: '
                       'id=%s.', volume['id'])
@@ -3384,11 +3747,11 @@ class HPE3PARCommon(object):
                 LOG.debug('Copy volume completed: convert_to_base_volume: '
                           'id=%s.', volume['id'])
 
-            comment = self._get_3par_vol_comment(volume_name)
-            if comment:
-                self.client.modifyVolume(temp_vol_name, {'comment': comment})
-                LOG.debug('Assigned the comment: convert_to_base_volume: '
-                          'id=%s.', volume['id'])
+            # The comment was already set when the copy was created, but the
+            # key/value metadata is not copied by the array, so copy it now.
+            self._copy_volume_metadata(volume_name, temp_vol_name)
+            LOG.debug('Copied the metadata: convert_to_base_volume: '
+                      'id=%s.', volume['id'])
 
             # Delete source volume (osv-) after the copy is complete
             self.client.deleteVolume(volume_name)
@@ -3473,14 +3836,13 @@ class HPE3PARCommon(object):
 
                         # Update v2 object as required for
                         # _convert_to_base function
-                        v2['volume_type_id'] = (
-                            self._get_3par_vol_comment_value(
-                                v1['comment'], 'volume_type_id'))
+                        v2['volume_type_id'] = self._get_volume_key_value(
+                            v1_name, 'volume_type_id', v1.get('comment'))
 
-                        v2['id'] = self._get_3par_vol_comment_value(
-                            v2['comment'], 'volume_id')
-                        v2['_name_id'] = self._get_3par_vol_comment_value(
-                            v2['comment'], '_name_id')
+                        v2['id'] = self._get_volume_key_value(
+                            v2_name, 'volume_id', v2.get('comment'))
+                        v2['_name_id'] = self._get_volume_key_value(
+                            v2_name, '_name_id', v2.get('comment'))
 
                         v2['host'] = '#' + v1['userCPG']
 
@@ -5488,11 +5850,11 @@ class ReplicateVolumeTask(flow_utils.CinderTask):
 
 class ModifyVolumeTask(flow_utils.CinderTask):
 
-    """Task to change a volume's snapCPG and comment.
+    """Task to change a volume's snapCPG and metadata.
 
-    This is a task for changing the snapCPG and comment.  It is intended for
-    use during retype().  These changes are done together with a single
-    modify request which should be fast and easy to revert.
+    This is a task for changing the snapCPG and the volume metadata.  It is
+    intended for use during retype().  These changes should be fast and easy
+    to revert.
 
     Because we do not support retype with existing snapshots, we can change
     the snapCPG without using a keepVV.  If snapshots exist, then this will
@@ -5501,14 +5863,18 @@ class ModifyVolumeTask(flow_utils.CinderTask):
     This task does not change the userCPG or provisioningType.  Those changes
     may require tunevv, so they are done by the TuneVolumeTask.
 
-    The new comment will contain the new type, VVS and QOS information along
-    with whatever else was in the old comment dict.
+    The new type, VVS and QOS information is stored in the backend's key/value
+    store instead of the volume comment, because modifying a comment requires
+    a PUT on the volume which can hang on the array.
 
-    The old comment and snapCPG are restored if revert is called.
+    The old metadata and snapCPG are restored if revert is called.
     """
+
+    METADATA_KEYS = ('vvs', 'qos', 'volume_type_name', 'volume_type_id')
 
     def __init__(self, action):
         self.needs_revert = False
+        self.old_metadata = {}
         super(ModifyVolumeTask, self).__init__(addons=[action])
 
     def _get_new_comment(self, old_comment, new_vvs, new_qos,
@@ -5548,6 +5914,11 @@ class ModifyVolumeTask(flow_utils.CinderTask):
         comment_dict = self._get_new_comment(
             old_comment, new_vvs, new_qos, new_type_name, new_type_id)
 
+        # Remember the current values so that revert can restore them.
+        self.old_metadata = {
+            key: common._get_volume_key_value(volume_name, key, old_comment)
+            for key in self.METADATA_KEYS}
+
         LOG.debug("API_VERSION: %(ver_1)s, API_VERSION_2023: %(ver_2)s",
                   {'ver_1': common.API_VERSION,
                    'ver_2': API_VERSION_2023})
@@ -5559,17 +5930,15 @@ class ModifyVolumeTask(flow_utils.CinderTask):
                      {'volume_name': volume_name,
                       'old_snap_cpg': old_snap_cpg,
                       'new_snap_cpg': new_snap_cpg})
-            common.client.modifyVolume(
-                volume_name,
-                {'snapCPG': new_snap_cpg,
-                 'comment': json.dumps(comment_dict)})
+            common.client.modifyVolume(volume_name,
+                                       {'snapCPG': new_snap_cpg})
             self.needs_revert = True
-        else:
-            LOG.info("Modifying %s comments.", volume_name)
-            common.client.modifyVolume(
-                volume_name,
-                {'comment': json.dumps(comment_dict)})
-            self.needs_revert = True
+
+        LOG.info("Modifying %s metadata.", volume_name)
+        common._set_volume_metadata(
+            volume_name,
+            **{key: comment_dict.get(key) for key in self.METADATA_KEYS})
+        self.needs_revert = True
 
     def revert(self, common, volume_name, old_snap_cpg, new_snap_cpg,
                old_comment, **kwargs):
@@ -5580,11 +5949,17 @@ class ModifyVolumeTask(flow_utils.CinderTask):
                       'new_snap_cpg': new_snap_cpg,
                       'old_snap_cpg': old_snap_cpg})
             try:
-                common.client.modifyVolume(
-                    volume_name,
-                    {'snapCPG': old_snap_cpg, 'comment': old_comment})
+                if (new_snap_cpg != old_snap_cpg and
+                        common.API_VERSION < API_VERSION_2023):
+                    common.client.modifyVolume(volume_name,
+                                               {'snapCPG': old_snap_cpg})
             except Exception as ex:
                 LOG.error("Exception during snapCPG revert: %s", ex)
+
+            try:
+                common._set_volume_metadata(volume_name, **self.old_metadata)
+            except Exception as ex:
+                LOG.error("Exception during metadata revert: %s", ex)
 
 
 class TuneVolumeTask(flow_utils.CinderTask):
