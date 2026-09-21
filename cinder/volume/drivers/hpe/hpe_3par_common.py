@@ -34,12 +34,10 @@ array.
 """
 
 import ast
-import hashlib
 import json
 import math
 import pprint
 import re
-import time
 import uuid
 
 from oslo_config import cfg
@@ -53,7 +51,6 @@ import taskflow.engines
 from taskflow.patterns import linear_flow
 
 from cinder import context
-from cinder import coordination
 from cinder import exception
 from cinder import flow_utils
 from cinder.i18n import _
@@ -140,21 +137,6 @@ hpe3par_opts = [
                     "(3) the backend is prezoned with this "
                     "specific nsp only. For example if nsp is 2 1 2, the "
                     "format of the option's value is 2:1:2"),
-    cfg.BoolOpt('hpe3par_image_seed_cache_enabled',
-                default=True,
-                help="Enable the per-size image seed clone cache. When a "
-                     "bootable volume larger than its source image is "
-                     "created from a Glance image stored on this array, the "
-                     "first such request builds a reusable read-only 'seed' "
-                     "volume at the requested size so that subsequent "
-                     "same-size requests are served as fast online clones. "
-                     "Disabled automatically for replicated volume types and "
-                     "CHAP-enabled backends."),
-    cfg.IntOpt('hpe3par_image_seed_max_age_days',
-               default=7,
-               min=1,
-               help="Number of days an unused image seed volume is retained "
-                    "before it is automatically deleted."),
 ]
 
 
@@ -367,10 +349,6 @@ class HPE3PARCommon(object):
     RC_GROUP_STARTED = 3
     SYNC_STATUS_COMPLETED = 3
     FAILBACK_VALUE = 'default'
-
-    # Image seed (per-size clone cache) markers
-    IMAGE_SEED_PREFIX = "ims-"
-    IMAGE_SEED_COMMENT_TYPE = "hpe_image_seed"
 
     # License values for reported capabilities
     PRIORITY_OPT_LIC = "Priority Optimization"
@@ -1274,9 +1252,6 @@ class HPE3PARCommon(object):
             if cpg == cinder_cpg:
                 size_gb = int(vol['sizeMiB'] / 1024)
                 vol_name = vol['name']
-                if vol_name.startswith(self.IMAGE_SEED_PREFIX):
-                    # Internal image seed cache volumes are not manageable.
-                    continue
                 if vol_name in already_managed:
                     is_safe = False
                     reason_not_safe = _('Volume already managed')
@@ -1833,9 +1808,6 @@ class HPE3PARCommon(object):
                       'replication_enabled': self._replication_enabled,
                       'replication_targets': self._get_replication_targets(),
                       'pools': pools}
-
-        # Opportunistically prune expired image seed cache volumes.
-        self._maybe_cleanup_image_seeds()
 
     def _check_license_enabled(self, valid_licenses,
                                license_to_check, capability):
@@ -2781,18 +2753,6 @@ class HPE3PARCommon(object):
                 # The size of the new volume is different, so we have to
                 # copy the volume and wait.  Do the resize after the copy
                 # is complete.
-                #
-                # When the source is a Cinder image-volume-cache entry (a
-                # raw, already-converted image) and the target is larger,
-                # serve the clone from a per-size image seed so only the
-                # first larger-than-image request pays the full offline
-                # copy and the rest are fast online clones.
-                handled, seed_model_update = (
-                    self._maybe_clone_via_image_seed(
-                        volume, src_vref, vol_name))
-                if handled:
-                    return seed_model_update
-
                 LOG.debug("Creating a clone of volume, using non-online copy.")
 
                 # we first have to create the destination volume
@@ -2841,304 +2801,6 @@ class HPE3PARCommon(object):
         except Exception as ex:
             LOG.error("Exception: %s", ex)
             raise exception.CinderException(ex)
-
-    # ---- Image seed (per-size clone cache) ------------------------------
-    #
-    # When a bootable volume is created from a Glance image, Cinder clones it
-    # from the raw image-volume-cache entry.  When the requested root disk is
-    # larger than that cache volume, the normal path performs a full offline
-    # base copy for every volume.  To avoid paying that cost repeatedly, the
-    # first larger-than-image request for a given (cache image, size) builds
-    # a read-only "image seed": a base volume, at the requested size, holding
-    # the image contents.  Every subsequent request for the same (image,
-    # size) is then an equal-size online clone from the seed, which is fast.
-    #
-    # The seed is always built from the raw cache volume, so it is correct
-    # for both raw and qcow2 images.  Seeds are not tracked by Cinder, so
-    # they are pruned automatically once unused for
-    # hpe3par_image_seed_max_age_days.
-
-    def _image_seed_cache_enabled(self):
-        return bool(self.config.safe_get('hpe3par_image_seed_cache_enabled'))
-
-    def _image_seed_max_age_seconds(self):
-        days = self.config.safe_get('hpe3par_image_seed_max_age_days')
-        try:
-            days = int(days)
-        except (TypeError, ValueError):
-            days = 7
-        if days <= 0:
-            days = 7
-        return days * 24 * 60 * 60
-
-    def _image_seed_name(self, image_id, size):
-        digest = hashlib.sha1(
-            ("%s:%s" % (image_id, size)).encode("utf-8")).hexdigest()
-        return "%s%s" % (self.IMAGE_SEED_PREFIX, digest[:24])
-
-    def _maybe_clone_via_image_seed(self, volume, src_vref, vol_name):
-        """Serve a larger-than-image clone from a per-size image seed.
-
-        Cinder clones a bootable volume from the raw image-volume-cache
-        entry.  When the requested root disk is larger than that cache
-        volume, the normal path performs a full offline base copy for every
-        volume.  Instead, build a per-(cache image, size) seed once and serve
-        subsequent requests as fast online clones.  Working from the raw
-        cache volume makes this correct for both raw and qcow2 images.
-
-        Returns (handled, model_update).  handled is False when the seed
-        path does not apply, so the caller falls back to the normal copy.
-        """
-        if not self._image_seed_cache_enabled():
-            return False, None
-        # Disabled for replicated and CHAP setups.
-        if self._volume_of_replicated_type(volume, hpe_tiramisu_check=True):
-            return False, None
-        if self._client_conf.get('hpe3par_iscsi_chap_enabled'):
-            return False, None
-        # Only meaningful when the source is a Cinder image-volume-cache
-        # entry (a raw, already-converted image) and the target is larger.
-        try:
-            if not volume_utils.is_image_cache_entry(src_vref):
-                return False, None
-        except Exception:
-            return False, None
-        if volume['size'] <= src_vref['size']:
-            return False, None
-
-        try:
-            type_info = self.get_volume_settings_from_type(volume)
-            cpg = type_info['cpg']
-            snap_cpg = type_info['snap_cpg']
-            src_vol_name = self._get_3par_vol_name(src_vref)
-            seed_key = src_vref['id']
-            seed_name = self._image_seed_name(seed_key, volume['size'])
-
-            seed = self._get_image_seed_details(seed_name)
-            if seed is None:
-                # Build the seed under a lock so only one request builds it
-                # for a given (image, size); concurrent requests wait, then
-                # find the seed and clone from it.
-                lock_name = 'hpe3par-image-seed-%s' % seed_name
-                with coordination.COORDINATOR.get_lock(lock_name):
-                    seed = self._get_image_seed_details(seed_name)
-                    if seed is None:
-                        self._create_image_seed(
-                            seed_name, src_vol_name, seed_key,
-                            volume['size'], cpg, snap_cpg,
-                            type_info['tpvv'], type_info['tdvv'],
-                            self.get_compression_policy(
-                                type_info['hpe3par_keys']))
-                        seed = self._get_image_seed_details(seed_name)
-
-            model_update = self._clone_boot_volume_from_seed(
-                volume, vol_name, seed_name, type_info)
-            if seed is not None:
-                self._touch_image_seed(seed_name, seed['_seed_meta'])
-            LOG.debug("Cloned volume %(vol)s from image seed %(seed)s.",
-                      {'vol': vol_name, 'seed': seed_name})
-            return True, model_update
-        except Exception as ex:
-            # Never fail volume creation because of the optimization; fall
-            # back to the standard clone-and-wait path.
-            LOG.warning("Image seed clone failed for volume %(vol)s; falling "
-                        "back to standard clone. Reason: %(err)s",
-                        {'vol': volume.get('id'), 'err': ex})
-            return False, None
-
-    def _build_image_seed_comment(self, image_id, size, created_at,
-                                  last_used_at):
-        return json.dumps({
-            'type': self.IMAGE_SEED_COMMENT_TYPE,
-            'image_id': image_id,
-            'size': size,
-            'created_at': created_at,
-            'last_used_at': last_used_at,
-        })
-
-    def _get_image_seed_details(self, seed_name):
-        """Return the seed volume dict (with '_seed_meta') if it is a seed."""
-        try:
-            seed = self.client.getVolume(seed_name)
-        except hpeexceptions.HTTPNotFound:
-            return None
-        comment = seed.get('comment')
-        if not comment:
-            return None
-        try:
-            meta = json.loads(comment)
-        except (ValueError, TypeError):
-            return None
-        if meta.get('type') != self.IMAGE_SEED_COMMENT_TYPE:
-            return None
-        seed['_seed_meta'] = meta
-        return seed
-
-    def _touch_image_seed(self, seed_name, meta):
-        """Best-effort refresh of a seed's last-used timestamp."""
-        try:
-            meta = dict(meta)
-            meta['last_used_at'] = time.time()
-            self.client.modifyVolume(seed_name, {'comment': json.dumps(meta)})
-        except Exception as ex:
-            LOG.debug("Could not update image seed %(seed)s usage time: "
-                      "%(err)s", {'seed': seed_name, 'err': ex})
-
-    def _create_image_seed(self, seed_name, image_vol_name, image_id,
-                           size, cpg, snap_cpg, tpvv, tdvv, compression):
-        """Build a read-only base seed from image_vol grown to size (GiB)."""
-        LOG.info("Building image seed %(seed)s from %(img)s at %(size)s GiB.",
-                 {'seed': seed_name, 'img': image_vol_name, 'size': size})
-        task_id = self._copy_volume(
-            image_vol_name, seed_name, cpg=cpg, snap_cpg=snap_cpg,
-            tpvv=tpvv, tdvv=tdvv, compression=compression)
-        task_status = self._wait_for_task_completion(task_id)
-        if task_status['status'] is not self.client.TASK_DONE:
-            try:
-                self.client.deleteVolume(seed_name)
-            except Exception:
-                LOG.warning("Could not clean up failed image seed %(seed)s.",
-                            {'seed': seed_name})
-            msg = _("Image seed copy task failed: seed=%(seed)s, "
-                    "status=%(status)s.") % {'seed': seed_name,
-                                             'status': task_status}
-            raise exception.VolumeBackendAPIException(data=msg)
-
-        image_vol = self.client.getVolume(image_vol_name)
-        image_size_mib = int(image_vol['sizeMiB'])
-        target_mib = self._capacity_from_size(size)
-        growth_mib = target_mib - image_size_mib
-        if growth_mib > 0:
-            self.client.growVolume(seed_name, growth_mib)
-
-        now = time.time()
-        comment = self._build_image_seed_comment(image_id, size, now, now)
-        self.client.modifyVolume(seed_name, {'comment': comment})
-        LOG.info("Image seed %(seed)s ready.", {'seed': seed_name})
-
-    def _clone_boot_volume_from_seed(self, volume, vol_name, seed_name,
-                                     type_info):
-        """Create the boot volume as a fast online clone of a seed."""
-        cpg = type_info['cpg']
-        qos = type_info['qos']
-        vvs_name = type_info['vvs_name']
-        flash_cache = self.get_flash_cache_policy(type_info['hpe3par_keys'])
-        compression = self.get_compression_policy(type_info['hpe3par_keys'])
-
-        # Build the standard clone comment and pass it to the copy so it is
-        # stamped as part of the online copy (via copyVolume's optional body)
-        # instead of a separate comment-only PUT afterwards, which some WSAPI
-        # v1 arrays time out on. This mirrors the equal-size online clone.
-        comments = {'volume_id': volume['id'],
-                    'name': volume['name'],
-                    'type': 'OpenStack'}
-        volume_type = type_info['volume_type']
-        type_id = volume.get('volume_type_id', None)
-        if type_id:
-            comments['volume_type_name'] = (
-                volume_type.get('name') if volume_type else None)
-            comments['volume_type_id'] = type_id
-            if vvs_name:
-                comments['vvs'] = vvs_name
-            else:
-                comments['qos'] = qos
-        display_name = volume.get('display_name', None)
-        if display_name:
-            comments['display_name'] = display_name
-
-        self._copy_volume(
-            seed_name, vol_name, cpg=cpg, snap_cpg=type_info['snap_cpg'],
-            tpvv=type_info['tpvv'], tdvv=type_info['tdvv'],
-            compression=compression, comment=json.dumps(comments))
-
-        LOG.debug(
-            'Online copy volume scheduled: clone_boot_volume_from_seed: '
-            'seed=%(seed)s, vol=%(vol)s.',
-            {'seed': seed_name, 'vol': vol_name})
-
-        # NOTE: We intentionally do NOT wait for the online copy task to
-        # complete here (same as the equal-size online clone path). On the
-        # array an online copy makes the volume immediately available while
-        # the physical copy proceeds in the background, so blocking on task
-        # completion only serialises bulk clone requests and slows down VM
-        # creation. The task is left to finish asynchronously on the array.
-
-        if qos or vvs_name or flash_cache is not None:
-            try:
-                self._add_volume_to_volume_set(
-                    volume, vol_name, cpg, vvs_name, qos, flash_cache)
-            except exception.InvalidInput as ex:
-                # Delete volume if unable to add it to the volume set
-                self.client.deleteVolume(vol_name)
-                dbg = {'volume': vol_name,
-                       'vvs_name': vvs_name,
-                       'err': str(ex)}
-                msg = _("Failed to add volume '%(volume)s' to vvset "
-                        "'%(vvs_name)s' because '%(err)s'") % dbg
-                LOG.error(msg)
-                raise exception.CinderException(msg)
-
-        hpe_tiramisu = self._volume_of_hpe_tiramisu_type(volume)
-        return self._get_model_update(volume['host'], cpg,
-                                      replication=False,
-                                      provider_location=self.client.id,
-                                      hpe_tiramisu=hpe_tiramisu)
-
-    def _maybe_cleanup_image_seeds(self):
-        """Throttled, best-effort pruning of expired image seeds."""
-        if not self._image_seed_cache_enabled():
-            return
-        now = time.time()
-        last = getattr(self, '_last_image_seed_cleanup', 0)
-        # Sweep at most once per hour.
-        if now - last < 3600:
-            return
-        self._last_image_seed_cleanup = now
-        try:
-            self._cleanup_expired_image_seeds()
-        except Exception as ex:
-            LOG.debug("Image seed cleanup skipped: %(err)s", {'err': ex})
-
-    def _cleanup_expired_image_seeds(self):
-        max_age = self._image_seed_max_age_seconds()
-        now = time.time()
-        try:
-            all_volumes = self.client.getVolumes()['members']
-        except Exception as ex:
-            LOG.debug("Could not list volumes for image seed cleanup: "
-                      "%(err)s", {'err': ex})
-            return
-
-        for vol in all_volumes:
-            name = vol.get('name') or ''
-            if not name.startswith(self.IMAGE_SEED_PREFIX):
-                continue
-            comment = vol.get('comment')
-            if comment is None:
-                try:
-                    comment = self.client.getVolume(name).get('comment')
-                except Exception:
-                    continue
-            if not comment:
-                continue
-            try:
-                meta = json.loads(comment)
-            except (ValueError, TypeError):
-                continue
-            if meta.get('type') != self.IMAGE_SEED_COMMENT_TYPE:
-                continue
-            last_used = meta.get('last_used_at') or meta.get('created_at') or 0
-            if now - last_used < max_age:
-                continue
-            lock_name = 'hpe3par-image-seed-%s' % name
-            try:
-                with coordination.COORDINATOR.get_lock(lock_name):
-                    self.client.deleteVolume(name)
-                LOG.info("Deleted expired image seed %(seed)s.",
-                         {'seed': name})
-            except Exception as ex:
-                LOG.debug("Could not delete expired image seed %(seed)s: "
-                          "%(err)s", {'seed': name, 'err': ex})
 
     def delete_volume(self, volume):
         vol_id = volume.id
